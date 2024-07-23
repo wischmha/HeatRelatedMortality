@@ -1,0 +1,842 @@
+---
+title:  "A1_Process.Rmd / Heat-Related Mortality / Exposure Response"
+author: "Hans-Aloys Wischmann"
+date:   "Written: 2023-04-12 to 2023-08-31 / Revised: 2024-06-15 to 2024-07-22 / Executed: `r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include = FALSE}
+  # ensure consistency across systems, define presets, set default figure size
+  Sys.setlocale("LC_ALL", 'en_US.UTF-8')
+  Sys.setenv(LANG = "en_US.UTF-8")
+  knitr::opts_chunk$set(echo = FALSE, dpi = 1200, fig.width = 10.0, fig.height = 10.0)
+  knitr::opts_knit$set(root.dir = getwd())
+
+  # create a clean slate
+  rm(list = ls())
+
+  # configurable parameters: years to use for modeling and prediction
+  YEARS_MODEL <- 2000:2023 # include COVID
+
+  # configurable parameters: seasonal week range to analyze (summer)
+  FIRST_SUMMER_WEEK <- 15 # begin of summer period, as in RKI model
+  LAST_SUMMER_WEEK  <- 40 # end of summer period, as in RKI model
+  DOF_TMPC          <-  8 # degrees of freedom for dose-response curves, as in RKI model
+  LAG_MAX           <- 11 # maximum number of days to look back for temperature exposure (a week and a half)
+
+  # configurable parameters: countries and NUTS levels to process
+  countries_of_interest <- c("UK" = "United Kingdom",
+                             "BE" = "Belgium", "NL" = "Netherlands", "LU" = "Luxembourg",
+                             "DE" = "Germany", "CH" = "Switzerland", "AT" = "Austria",
+                             "PT" = "Portugal", "ES" = "Spain", "FR" = "France", "IT" = "Italy")
+
+  levels_of_interest    <- c("UK" = 1, "BE" = 2, "NL" = 2, "LU" = 2, "DE" = 1, "CH" = 2, "AT" = 2, "PT" = 2, "ES" = 2, "FR" = 2, "IT" = 2)
+
+  # configurable parameters: geographies to exclude (regular expression)
+  geographies_to_exclude = "^FRY|^FRX|^ES7|^ES63|^ES64|^UKN|^UKM|^PT2|^PT3"
+
+  # document configurable parameters
+  params_config <- mget(ls())
+  save(params_config, file = "../Processed/Parameters.Rdata")
+
+  # define color palettes for categorical data with 12 entries
+  safe_colorblind_palette <- c("#88CCEE", "#CC6677", "#DDCC77", "#117733", "#332288", "#AA4499", "#44AA99", "#999933", "#882255", "#661100", "#6699CC", "#888888")
+
+  # function to replace install.packages/library combination
+  library_wrapper <- function(package) {
+    if (!require(package, character.only = TRUE)) {
+      install.packages(package)
+    }
+    library(package, character.only = TRUE)
+    message(paste("Using package:", package, "version", packageVersion(package)))
+  }
+
+  # load libraries, after installing if necessary
+  library_wrapper("tidyverse")
+  library_wrapper("readxl")
+  library_wrapper("foreach")
+  library_wrapper("doParallel")
+  library_wrapper("ISOweek")
+  library_wrapper("ncdf4")
+  library_wrapper("mgcv")
+  library_wrapper("sf")
+  library_wrapper("scales")
+  library_wrapper("lubridate")
+  library_wrapper("flextable")
+
+  # use half of all logical cores when processing in parallel
+  registerDoParallel(cores = detectCores(logical = TRUE) / 2)
+
+  # read/write csv and tsv files in "UTF-8" encoding with semi-colon as separator, without row numbers
+  load_csv <- function(file) { return(read.csv(file, sep = ";", encoding = "UTF-8")) }
+  load_tsv <- function(file) { return(read.csv(file, sep = "\t", encoding = "UTF-8")) }
+
+  # utility function to plot to *.png file and inline
+  pngplot <- function(file_name, aspect_ratio, plot_object, plot_width = 8.0, plot_res = 1200) {
+    print(plot_object)
+    plot_file <- sprintf("../Plots/%s.png", file_name)
+    png(plot_file, width = plot_width, height = plot_width * aspect_ratio, units = "in", res = plot_res)
+    print(plot_object)
+    ignore <- dev.off()
+  }
+  
+  # create a standard theme
+  std_theme <- function() {
+    theme(
+      panel.border     = element_rect(colour = "black", fill = NA),
+      panel.background = element_rect(fill   = "white"),
+      panel.grid.major = element_line(colour = "gray80", linewidth = 0.2),
+      axis.text  = element_text(colour = "black"),
+      axis.title = element_text(colour = "black"),
+      axis.ticks = element_line(colour = "black"),
+      legend.position = "right"
+    )
+  }
+
+  # week lookup table
+  FIRST_WEEK <- sprintf("%d-W01-1", min(YEARS_MODEL))
+  LAST_WEEK  <- sprintf("%d-W52-1", max(YEARS_MODEL))
+  week_table <- data.frame(date_from = seq(ISOweek2date(FIRST_WEEK), ISOweek2date(LAST_WEEK), 7)) %>%
+    mutate(date_to = date_from + 6, year = isoyear(date_from), week = isoweek(date_from))
+
+  # mid year tick marks for multi-year plots
+  MID_YEAR_DATES <- seq(as.Date(sprintf("%d-07-01", min(YEARS_MODEL))),
+                        as.Date(sprintf("%d-07-01", max(YEARS_MODEL))), by = "year")
+
+  # age ranges (standard plus coarse to match available data), plus mapping for aggregation
+  age_5y_standard <- data.frame(age_from = seq(0, 85, 5),    age_to = c(seq(4, 84, 5), 99)) %>%
+    mutate(age = fct_inorder(paste(age_from, age_to, sep = "-")))
+  age_4cat_coarse <- data.frame(age_from = c(0, 65, 75, 85), age_to = c(64, 74, 84, 99))    %>%
+    mutate(age = fct_inorder(paste(age_from, age_to, sep = "-")))
+  age_aggregate   <- left_join(age_5y_standard, age_4cat_coarse, join_by("age_from" >= "age_from", "age_to" <= "age_to")) %>%
+    select(age = age.x, age_cat = age.y)
+```
+
+## Prerequisites
+
+A0_Download.sh
+
+## Geography
+
+Acknowledgement for administrative boundaries: © EuroGeographics for the administrative boundaries
+
+```{r NUTS}
+  # read NUTS map / geography provided by EU commission, note required acknowledgement (above)
+  geo_info <- data.frame(read_sf("../Downloads/Geography/NUTS_RG_01M_2021_4326.shp")) %>%
+    filter(LEVL_CODE %in% 1:2, str_sub(NUTS_ID, 1, 2) %in% names(countries_of_interest)) %>%             # 1st to 2nd level
+    select(level = LEVL_CODE, id_region = NUTS_ID, region = NUTS_NAME, geometry) %>%                     # discard irrelevant info
+    mutate(region = ifelse(str_sub(region, 1, 6) != "Centre", region, "Centre-Val de Loire")) %>%        # fix nasty hyphen
+    mutate(region = ifelse(str_sub(region, 1, 6) != "Proven", region, "Provence-Alpes-Côte d'Azur")) %>% # fix nasty apostrophe
+    mutate(country = str_replace_all(str_sub(id_region, 1, 2), countries_of_interest)) %>%               # assign country to each geo
+    mutate(country = ifelse(str_sub(id_region, 1, 2) == "UK",  "England", country)) %>%                  # treat England as a country
+    mutate(country = ifelse(str_sub(id_region, 1, 3) == "UKL", "Wales",   country)) %>%                  # treat Wales as a country
+    arrange(country, region) %>%
+    filter(level == levels_of_interest[str_sub(id_region, 1, 2)])
+  geo_info %>% select(id_region, region) %>%
+    filter(grepl(geographies_to_exclude, id_region)) %>%
+    arrange(id_region) %>%
+    flextable() %>% set_caption("Excluded regions") %>% autofit()
+  geo_info <- geo_info %>% filter(!grepl(geographies_to_exclude, id_region)) 
+  save(geo_info, file = "../Processed/Geography.Rdata", compress = "xz")
+
+  # process 5-digit post / zip codes for France, for mapping individual death record locations to NUTS3 regions
+  zip_codes_fr <- load_csv("../Downloads/Geography/pc2020_FR_NUTS-2021_v2.0.csv") %>%
+    mutate(id_region = str_replace_all(NUTS3, "'", ""), zip = as.integer(str_replace_all(CODE, "'", "")) %/% 1000) %>%
+    group_by(id_region) %>% reframe(zip = median(zip)) %>% arrange(zip) %>% filter(zip <= 95) %>% # metropolitan France only
+    mutate(id_region = str_sub(id_region, 1, 2 + levels_of_interest["FR"])) %>%
+    left_join(., geo_info, by = "id_region") %>%
+    select(zip, id_region) %>%
+    mutate(zip = case_when(id_region == "FRM01" ~ "2A", id_region == "FRM02" ~ "2B", TRUE ~ as.character(zip))) %>%
+    distinct()
+  save(zip_codes_fr, file = "../Processed/ZIP_France.Rdata", compress = "xz")
+
+  # number of regions per country
+  geo_info %>% select(id_region, country) %>% group_by(country) %>% reframe(n = n()) %>%
+    flextable() %>% set_caption("Number of regions per country") %>% autofit()
+```
+
+## Populations: Eurostat
+
+© European Union, 1995-2024
+
+Unless otherwise indicated (e.g. in individual copyright notices), content owned by the EU on this website is licensed under the Creative Commons Attribution 4.0 International (CC BY 4.0) licence.
+
+This means that reuse is allowed, provided appropriate credit is given and changes are indicated
+
+```{r population_eurostat}
+  # string to convert age range texts to age ranges
+  ages_replace <- c("Y_LT1" = "0", "Y_LT5" = "0-4", "Y_GE85" = "85-99", "Y" = "")
+  ages_ignore  <- c("UNK", "TOTAL", "Y_GE75", "Y_GE80", "Y_GE90", "Y_OPEN")
+
+  # read NUTS2 level populations statistics file from Eurostat
+  population_eurostat <- load_tsv("../Downloads/Population/Population_NUTS2.tsv") %>%
+    rename("label" = "freq.unit.sex.age.geo.TIME_PERIOD") %>%
+    separate_wider_delim(label, names = c("ignore1", "ignore2", "sex", "age", "geo"), delim = ",") %>%
+    filter(sex %in% c("F", "M"), !age %in% ages_ignore, geo %in% unique(geo_info$id_region), str_sub(geo, 1, 2) != "UK") %>%
+    mutate(country = as.character(countries_of_interest[str_sub(geo, 1, 2)])) %>%
+    select(geo, country, sex, age, starts_with("X20")) %>%
+    pivot_longer(starts_with("X"), names_to = "year", values_to = "n_pop") %>%
+    mutate(age = str_replace_all(age, ages_replace)) %>%
+    filter(!grepl(":", n_pop)) %>%
+    mutate(year = as.double(str_sub(year, 2, -1)), n_pop = as.integer(gsub(" .*$", "", n_pop)))
+
+  # manually correct two broken entries that could be recovered/computed for Male from Total - Female
+  population_eurostat <-
+    rbind(population_eurostat, data.frame(geo = "ES21", country = "Spain", sex = "M", age = "45-49", year = 2001, n_pop = 71911))
+  population_eurostat %>% filter(geo == "ES21", year == 2001, age == "45-49") %>%
+    flextable() %>% set_caption("Missing n_pop data for males computed from total - females")
+```
+
+## Populations: ONS
+
+ONS Crown Copyright Reserved [from Nomis on 25 June 2024]
+
+```{r population_ONS}
+  # read NOMIS query results files, excluding Scotland and Northern Ireland
+  population_region_ONS <- load_tsv("../Downloads/Population/Population_England_Wales_NUTS1.tsv") %>%
+    filter(!region %in% c("Scotland", "Northern Ireland")) %>%
+    mutate(sex = str_sub(Gender, 1, 1), age = str_replace_all(Age, c("Age " = "", "Aged " = "", " " = "", "85[+]" = "85-99"))) %>%
+    left_join(., geo_info %>% select(id_region, region) %>%
+    mutate(region = str_replace_all(region, c(" [(]England[)]" = "", " of England" = "", "the" = "The"))), by = "region") %>%
+    mutate(country = ifelse(region == "Wales", "Wales", "England")) %>%
+    select(geo = id_region, country, sex, age, year = date, n_pop = value)
+```
+
+## Populations: Aggregate and Save
+
+```{r populations}
+  # combine Eurostat and ONS populations data
+  population_5y <- rbind(population_eurostat, population_region_ONS)
+
+  # aggregated to 4 coarse brackets
+  population_4cat <- left_join(population_5y, age_aggregate, by = "age") %>%
+    group_by(geo, country, sex, year, age = age_cat) %>% reframe(n_pop = sum(n_pop))
+
+  # save and clean up
+  save(population_5y, population_4cat, file = "../Processed/Populations.Rdata", compress = "xz")
+  print(sprintf("Populations.Rdata (is.na = %d)", sum(is.na(population_5y)) + sum(is.na(population_4cat))))
+  rm(list = ls(pattern = "populations"))
+  load(file = "../Processed/Populations.Rdata")
+```
+
+## Quick visualizations: Populations
+
+```{r visualize_population_pyramids}
+  # quick visual inspection
+  pngplot("Figure_S1", aspect_ratio = 1.0,
+    population_5y %>% filter(year == 2022) %>% mutate(n_pop = ifelse(sex == "F", -n_pop, n_pop)) %>%
+    left_join(., age_5y_standard, by = "age") %>% arrange(age_from) %>% mutate(age = fct_inorder(age)) %>%
+    ggplot(aes(x = age, y = n_pop, fill = sex)) + geom_col() +
+      scale_y_continuous(labels = ~abs(.x)) +
+      labs(x = "Age [years]", y = "", title = "2022: Population Data © European Union, 1995-2024 and ONS, 2024") +
+      scale_fill_discrete(name = "Sex") +
+      coord_flip() + 
+      facet_wrap(~country, scale = "free_x") +
+      std_theme() + theme(legend.position = "bottom"))
+```
+
+# Deaths (Eurostat)
+
+© European Union, 1995-2024
+
+Unless otherwise indicated (e.g. in individual copyright notices), content owned by the EU on this website is licensed under the Creative Commons Attribution 4.0 International (CC BY 4.0) licence.
+
+This means that reuse is allowed, provided appropriate credit is given and changes are indicated
+
+```{r deaths_eurostat}
+  # string to convert age range texts to age ranges
+  ages_replace <- c("Y_LT1" = "0", "Y_LT5" = "0-4", "Y_GE85" = "85-99", "Y_GE90" = "90-99", "Y" = "")
+  ages_ignore  <- c("UNK", "TOTAL")
+
+  # read NUTS2 level weekly death statistics file from Eurostat
+  deaths_eurostat <- load_tsv("../Downloads/Population/Deaths_Weekly_NUTS2.tsv")  %>% 
+    # separate concatenated variables from label column
+    rename("label" = "freq.age.sex.unit.geo.TIME_PERIOD") %>%
+    separate_wider_delim(label, names = c("ignore1", "age", "sex", "ignore2", "geo"), delim = ",") %>%
+    # use data by sex, ignore deaths at unknown age, select only geographies of interest
+    filter(sex %in% c("F", "M"), !age %in% ages_ignore, geo %in% unique(geo_info$id_region), !str_sub(geo, 1, 2) %in% c("UK", "FR", "DE")) %>%
+    mutate(age = str_replace_all(age, ages_replace)) %>%
+    # keep only relevant info, in correct order
+    select(geo, sex, age, starts_with("X20")) %>%
+    # convert to tidy format
+    pivot_longer(starts_with("X"), names_to = "year_week", values_to = "n_deaths") %>%
+    # convert year.week into start date of week
+    mutate(year_week = str_replace_all(year_week, c("X" = "", "[.]" = "-", "$" = "-1")), date_from = ISOweek2date(year_week)) %>%
+    # remove rows with missing data and convert number of deaths to integer
+    filter(!grepl(":", n_deaths)) %>% mutate(n_deaths = as.integer(gsub(" .*$", "", n_deaths))) %>%
+    mutate(country = as.character(countries_of_interest[str_sub(geo, 1, 2)])) %>%
+    select(geo, country, sex, age, date_from, n_deaths)
+```
+
+# Deaths (DESTATIS)
+
+© Statistisches Bundesamt (Destatis), 2024
+
+Vervielfältigung und Verbreitung, auch auszugsweise, mit Quellenangabe gestattet.
+
+```{r deaths_DESTATIS}
+  # Read two different files and two separate tabs in each file, one for each sex
+  deaths_2000_2019_m <- read_excel("../Downloads/Population/Deaths_Germany_2000_2019.xlsx", sheet = "csv-12613-10", col_types = "text")
+  deaths_2000_2019_f <- read_excel("../Downloads/Population/Deaths_Germany_2000_2019.xlsx", sheet = "csv-12613-11", col_types = "text")
+  deaths_2020_2023_m <- read_excel("../Downloads/Population/Deaths_Germany_2020_2023.xlsx", sheet = "csv-12613-10", col_types = "text")
+  deaths_2020_2023_f <- read_excel("../Downloads/Population/Deaths_Germany_2020_2023.xlsx", sheet = "csv-12613-11", col_types = "text")
+  deaths_DESTATIS <- rbind(deaths_2000_2019_m, deaths_2000_2019_f, deaths_2020_2023_m, deaths_2020_2023_f) %>% select(!Statistik)
+
+  # combine four tables, all with same columns, select 2000-2023 years
+  deaths_DESTATIS <- deaths_DESTATIS  %>% distinct() %>%
+    filter(Jahre %in% YEARS_MODEL, Alter != "Insgesamt") %>%
+    mutate(age = str_replace(Alter, "85[+]", "85-99"), sex = ifelse(Geschlecht == "Weiblich", "F", "M")) %>%
+    mutate(year_week = sprintf("%04d-W%02d-1", as.integer(Jahre), as.integer(Kalenderwoche)), date_from = ISOweek2date(year_week)) %>%
+    left_join(., geo_info  %>% select(id_region, region, country), join_by("Gebiet" == "region")) %>%
+    select(geo = id_region, country, sex, age, date_from, n_deaths = Sterbefaelle) %>%
+    filter(!n_deaths %in% c("X", ".")) %>% mutate(n_deaths = as.integer(n_deaths))
+```
+
+## Deaths (ONS, Commissioned)
+
+```{r deaths_ONS}
+  # ONS uses region codes, NUTS requires the long version, conversion vector
+  region_strings <- c("E12000001" = "North East (England)", "E12000002" = "North West (England)", "E12000003" = "Yorkshire and the Humber",
+                      "E12000004" = "East Midlands (England)", "E12000005" = "West Midlands (England)",  "E12000006" = "East of England",
+                      "E12000007" = "London", "E12000008" = "South East (England)", "E12000009" = "South West (England)", "W92000004" = "Wales")
+
+  # deaths by week of occurrence, by region, by sex, and by five-year age group
+  deaths_ONS <-
+    read_xlsx("../Downloads/Population/Deaths_England_Wales_1981_2022.xlsx", sheet = "1", skip = 5) %>%
+    rename("date_from" = "Week start date\r\n(Saturday)") %>% select(!starts_with("Week")) %>%
+    mutate(sex = ifelse(Sex == "1", "M", "F")) %>% # as specified in Notes sheet inside the file
+    pivot_longer(starts_with(c("E", "W")), names_to = "region_age", values_to = "n_deaths") %>%
+    mutate(region_code = gsub("_.*", "", region_age), age_range = gsub(".*_", "", region_age)) %>%
+    mutate(region = str_replace_all(region_code, region_strings)) %>%
+    mutate(age = str_replace_all(age_range, c("<1" = "0-4", "95[+]" = "95-99", "01-04" = "0-4", "05-09" = "5-9"))) %>%
+    left_join(., geo_info  %>% select(id_region, region, country), by = "region") %>%
+    filter(date_from >= week_table$date_from[1] - 2) %>%
+    group_by(geo = id_region, country, sex, age, date_from) %>% reframe(n_deaths = sum(n_deaths))
+```
+
+## Deaths (INSEE)
+
+```{r deaths_INSEE}
+  # read all annual and monthly death record files
+  file_names <- list.files(path = "../Downloads/Population/", pattern = "Deaths_France_", full.names = TRUE, recursive = FALSE)
+  deaths_raw <- foreach (i = 1:length(file_names), .combine = "rbind", .packages = "tidyverse") %dopar% {
+    load_csv(file_names[i]) %>% select(sex = sexe, datenaiss, datedeces, lieunaiss, lieudeces) %>%
+      mutate(sex = ifelse(sex == 1, "M", "F")) %>%
+      mutate(lieunaiss = as.character(lieunaiss), lieudeces = as.character(lieudeces)) %>% filter(lieudeces != "") %>%
+      mutate(lieudeces = str_replace_all(lieudeces, c("2A" = "20", "2B" = "20"))) %>%
+      mutate(datenaiss = as.Date(as.character(datenaiss), format = "%Y%m%d")) %>% filter(!is.na(datenaiss))  %>%
+      mutate(datedeces = as.Date(as.character(datedeces), format = "%Y%m%d")) %>% filter(!is.na(datedeces))  %>%
+      mutate(age_at_death = as.integer(difftime(datedeces, datenaiss, units = "days")) %/% 365.25) %>% filter(age_at_death %in% 0:120) %>%
+      mutate(age_at_death = pmin(age_at_death, 99)) %>%
+      mutate(zip = as.integer(lieudeces) %/% 1000) %>% filter(zip > 0, zip < 96)
+  }
+
+  # clean up records, remove full duplicates (noting that distinct is much faster than unique)
+  deaths_unique <- distinct(deaths_raw) %>% select(sex, age_at_death, datedeces, zip) %>% mutate(zip = as.character(zip))
+
+  # exclude records for deaths that occurred in prior years, retain only deaths from FIRST_WEEK to LAST_WEEK
+  deaths_INSEE <- deaths_unique %>%
+    filter(datedeces >= min(week_table$date_from), datedeces <= max(week_table$date_to)) %>%
+    left_join(., zip_codes_fr, by = "zip") %>%
+    left_join(., age_5y_standard, join_by("age_at_death" >= "age_from", "age_at_death" <= "age_to")) %>%
+    left_join(., week_table, join_by("datedeces" >= "date_from", "datedeces" <= "date_to")) %>%
+    group_by(geo = id_region, sex, age, date_from) %>% reframe(n_deaths = n()) %>%
+    complete(geo, sex, age, date_from, fill = list(n_deaths = 0)) %>% mutate(country = "France")
+```
+
+## Deaths: Aggregate and Save
+
+```{r deaths}
+  # combine deaths into one tidy table, combine all 85+ groups into one age category, calculate year, append population info
+  deaths_5y <- rbind(deaths_eurostat, deaths_ONS, deaths_INSEE) %>%
+    mutate(age = str_replace_all(age, c("85-89" = "85-99", "90-94" = "85-99", "95-99" = "85-99", "90-99" = "85-99"))) %>%
+    group_by(geo, country, sex, age, date_from) %>% reframe(n_deaths = sum(n_deaths))
+
+  # aggregate to 4 categories, append Germany
+  deaths_4cat <- left_join(deaths_5y, age_aggregate, by = "age") %>%
+    group_by(geo, country, sex, age = age_cat, date_from) %>% reframe(n_deaths = sum(n_deaths)) %>%
+    rbind(., deaths_DESTATIS)
+
+  # save and clean up
+  save(deaths_5y, deaths_4cat, file = "../Processed/Deaths.Rdata", compress = "xz")
+  print(sprintf("Deaths.Rdata (is.na = %d)", sum(is.na(deaths_5y)) + sum(is.na(deaths_4cat))))
+  rm(list = ls(pattern = "deaths"))
+  load(file = "../Processed/Deaths.Rdata")
+```
+
+## Populations: 1km x 1km grid, accumulate onto 0.1 x 0.1 degree grid (inside regions)
+
+© Eurostat, 1995 - today
+
+```{r population_distribution}
+  # names of downloaded files
+  grid_shape_file <- "../Downloads/Geography/JRC_POPULATION_2018.shp"
+
+  # read file with shapes and population density at 1km by 1km resolution, convert to longitude/latitude
+  population_density <- read_sf(grid_shape_file) %>% filter(CNTR_ID %in% names(countries_of_interest)) %>% st_transform(crs = 4326) %>% select(geometry, pop = TOT_P_2018)
+
+  # compute centroid for each polygon (1km by 1km)
+  centroids <- data.frame(st_coordinates(st_centroid(population_density$geometry)))
+  population_density <- population_density %>% mutate(long = centroids$X, lat = centroids$Y) %>% select(!geometry)
+
+  # find region that each populated node (1km x 1km grid) falls within
+  st_p <- st_as_sf(x = population_density, coords = c("long", "lat"), crs = 4326)
+  w_in <- map_int(st_within(st_p, geo_info$geometry), ~ifelse(length(.x) > 0, .x[1], NA))
+  populated_grid <- population_density %>% mutate(region = geo_info$id_region[w_in]) %>% drop_na() %>%
+    mutate(long = 0.10 * floor(10.0 * long) + 0.05, lat = 0.10 * floor(10.0 * lat) + 0.05) %>%
+    group_by(geo = region, long, lat) %>% reframe(pop = sum(pop))
+  save(populated_grid, file = "../Processed/Populated_Grid.Rdata", compress = "xz")
+
+  # plot populated grid for visual check
+  pngplot("Figure_S2", aspect_ratio = 1.2,
+    populated_grid %>%
+    group_by(long, lat) %>% reframe(pop = pmin(pmax(log10(sum(pop)), 2.5), 5.5)) %>%
+    mutate(long_min = long - 0.05, long_max = long + 0.05, lat_min = lat - 0.05, lat_max = lat + 0.05) %>%
+    ggplot(aes(xmin = long_min, xmax = long_max, ymin = lat_min, ymax = lat_max, fill = pop)) +
+      geom_sf(data = geo_info$geometry, inherit.aes = FALSE, aes(), linewidth = 0.1, color = "white", fill = "white") +
+      geom_rect() +
+      labs(title = "2018 Population (0.1 ° x 0.1 ° Grid)", fill = "Population",
+           y = "© Eurostat, EFGS, for the populations density grid",
+           x = "© EuroGeographics for the administrative boundaries") +
+      scale_fill_gradient(low = "white", high = "black", breaks = 3:5, labels = ~sprintf("%d", 10^(3:5)), limits = c(2.5, 6.0)) +
+      geom_sf(data = geo_info$geometry, inherit.aes = FALSE, aes(), linewidth = 0.2, color = "black", fill = NA) +
+      std_theme())
+```
+
+## Daily Mean Temperatures
+
+Do not attempt to run this chunk with less than 16 GB of RAM!
+
+Acknowledgment: We acknowledge the E-OBS dataset from the EU-FP6 project UERRA (https://www.uerra.eu) and the Copernicus Climate Change Service, and the data providers in the ECA&D project (https://www.ecad.eu)
+
+Citation: Cornes, R., G. van der Schrier, E.J.M. van den Besselaar, and P.D. Jones. 2018: An Ensemble Version of the E-OBS Temperature and Precipitation Datasets, J. Geophys. Res. Atmos., 123. doi:10.1029/2017JD028200
+
+```{r daily_mean_temperature_eobs}
+  # names of downloaded temperature file
+  mean_file <- "../Downloads/Temperature/tg_ens_mean_0.1deg_reg_v29.0e.nc"
+  date_from <- min(week_table$date_from) - LAG_MAX - 2 # ONS week starts on Saturday prior to Monday of ISO week
+
+  # read temperature grid file for Europe (ensemble mean, all longitudes, all latitudes, since 1950-01-01)
+  nc_file  <- nc_open(mean_file)
+  long     <- 0.10 * floor(10.0 * ncvar_get(nc_file, "longitude")) + 0.05 # longitude [°] -> center
+  lat      <- 0.10 * floor(10.0 * ncvar_get(nc_file, "latitude"))  + 0.05 # latitude [°]  -> center
+  idx_date <- as.integer(date_from - as.Date("1950-01-01")) + 1
+  date_nc  <- as.Date("1950-01-01") + ncvar_get(nc_file, "time", start = idx_date, count = -1)
+
+  # block read all temperatures at once (30 seconds, avoids 4.5 hours of poking in the file)
+  tmp <- ncvar_get(nc_file, "tg", start = c(1, 1, idx_date), count = c(-1, -1, -1), raw_datavals = TRUE)
+  tmpc_scale_factor <- ncatt_get(nc_file, "tg", "scale_factor")$value
+  tmpc_fill_value   <- ncatt_get(nc_file, "tg", "_FillValue")$value
+  tmpc_missing      <- tmpc_fill_value * tmpc_scale_factor
+  nc_close(nc_file)
+
+  # efficiently determine index (in temperature grid) for all elements of populations grid
+  long_lookup <- data.frame(long, long_index = 1:length(long))
+  lat_lookup  <- data.frame(lat,  lat_index  = 1:length(lat))
+  populated_grid_with_lookup <- left_join(left_join(populated_grid, long_lookup, by = "long"), lat_lookup, by = "lat")
+
+  # loop in parallel over regions, compute population_weighted mean temperature
+  regions <- unique(populated_grid_with_lookup$geo)
+  tmpc_mean <- foreach (i = 1:length(regions), .combine = "cbind", .packages = "tidyverse") %dopar% {
+    grid_region <- populated_grid_with_lookup %>% filter(geo == regions[i])
+    sum_temp <- rep(0.0, dim(tmp)[3])
+    sum_pop  <- rep(0.0, dim(tmp)[3])
+    for (j in 1:nrow(grid_region)) {
+      idx_long <- grid_region$long_index[j]
+      idx_lat  <- grid_region$lat_index[j]
+      pop      <- grid_region$pop[j]
+      tmpc_point <- tmpc_scale_factor * as.vector(tmp[idx_long,idx_lat,])
+      sum_temp   <- sum_temp + ifelse(tmpc_point > tmpc_missing, pop * tmpc_point, 0.0)
+      sum_pop    <- sum_pop  + ifelse(tmpc_point > tmpc_missing, pop,              0.0)
+    }
+    tmpc_mean <- data.frame(tmp = round(sum_temp / sum_pop, 1))
+    names(tmpc_mean) <- grid_region$geo[1]
+    tmpc_mean
+  }
+
+  # convert to tidy table
+  temperatures <- cbind(date_nc, tmpc_mean) %>% pivot_longer(!date_nc, names_to = "geo", values_to = "tmp") %>% rename("date" = "date_nc")
+
+  # compute all lagged temperatures, including 0..3 days, 4..7 days, and 0..7 days
+  temperatures_daily_lagged = expand.grid(lag = 0:LAG_MAX, date_0 = date_nc, geo = unique(geo_info$id_region)) %>%
+    mutate(date = date_0 - lag) %>%
+    left_join(., temperatures, by = c("geo", "date")) %>%
+    select(!date) %>% rename("date" = "date_0") %>%
+    pivot_wider(values_from = "tmp", names_from = "lag", names_prefix = "tmpc_lag_") %>%
+    filter(complete.cases(.)) %>%
+    mutate(tmpc_lag_0_0  = tmpc_lag_0,
+           tmpc_lag_0_3  = round((tmpc_lag_0 + tmpc_lag_1 + tmpc_lag_2  + tmpc_lag_3)  * 0.25, 1),
+           tmpc_lag_4_7  = round((tmpc_lag_4 + tmpc_lag_5 + tmpc_lag_6  + tmpc_lag_7)  * 0.25, 1),
+           tmpc_lag_8_11 = round((tmpc_lag_8 + tmpc_lag_9 + tmpc_lag_10 + tmpc_lag_11) * 0.25, 1)) %>%
+    select(geo, date, tmpc_lag_0_0, tmpc_lag_0_3, tmpc_lag_4_7, tmpc_lag_8_11)
+
+  # compute all lagged temperatures for all days-of-the-week for all weeks
+  temperatures_weekly_lagged <- expand.grid(geo = unique(geo_info$id_region), date_from = unique(deaths_4cat$date_from), day_of_week = 0:6) %>%
+    mutate(date = date_from + day_of_week) %>%
+    left_join(., temperatures_daily_lagged, by = c("geo", "date")) %>%
+    filter(complete.cases(.)) %>%
+    select(!date) %>%
+    pivot_longer(starts_with("tmp"), names_to = "lag", values_to = "tmp") %>%
+    mutate(variable = sprintf("%s_dow_%s", lag, day_of_week)) %>% select(geo, date_from, variable, tmp) %>%
+    pivot_wider(values_from = "tmp", names_from = "variable")
+
+  # save temperatures for all days and all weeks
+  save(temperatures_daily_lagged, temperatures_weekly_lagged, file = "../Processed/Temperatures.Rdata", compress = "xz")
+  print(sprintf("Temperatures.Rdata (is.na = %d)", sum(is.na(temperatures_daily_lagged)) + sum(is.na(temperatures_weekly_lagged))))
+  rm(list = ls(pattern = "temperatures"))
+  load("../Processed/Temperatures.Rdata")
+
+  # count consecutive number of days > 25 by region using run length encoding (rle)
+  consecutive_days_25 <- temperatures_daily_lagged %>%
+    arrange(geo, date) %>%
+    mutate(warm = tmpc_lag_0_0 >= 25.0) %>%
+    group_by(geo) %>%
+    reframe(length = rle(warm)$lengths, values = rle(warm)$values) %>%
+    filter(values == TRUE, length >= 3) %>%  # at least three consecutive days
+    group_by(geo, length) %>%
+    reframe(n = n()) %>%
+    filter(length <= 21) %>%
+    left_join(., geo_info %>% select(id_region, country), join_by("geo" == "id_region")) %>%
+    group_by(country, length) %>% reframe(n = sum(n))
+
+  ts <- sprintf("Hot Stretches by Region (%s to %s)", min(temperatures_daily_lagged$date), max(temperatures_daily_lagged$date))
+  pngplot("Figure_S3", aspect_ratio = 1.0,
+    consecutive_days_25 %>%
+    ggplot(aes(x = length, y = n, group_by = country, color = country, label = country)) +
+      geom_point(size = 3.0) + geom_line(linewidth = 1.0) +
+      scale_x_continuous(breaks = c(3, 7, 14, 21), trans = "log") +
+      scale_color_manual(values = safe_colorblind_palette) +
+      labs(title = ts, y = "Cumulative Number of Stretches (across Regions)", x = "Consecutive Days >= 25 °C Mean Temperature") +
+    std_theme() +
+    theme(legend.position = "bottom", legend.title = element_blank()))
+```
+
+## Temperature Plots
+
+```{r temperature_plots}
+  # create example plots for heat waves of 2003, 2019, and 2023
+  pngplot("Figure_S4", aspect_ratio = 1.0,
+    temperatures_daily_lagged %>%
+    filter(date %in% c("2003-08-12", "2019-07-25", "2023-08-24")) %>%
+    pivot_longer(starts_with("tmp"), names_to = "lag", values_to = "tmp") %>%
+    mutate(lag = str_replace(lag, "tmpc_lag_", "")) %>%
+    separate_wider_delim(lag, names = c("lmin", "lmax"), delim = "_") %>%
+    mutate(cat = ifelse(lmax == "0", as.character(date), sprintf("%s - %s", date - as.integer(lmax), date - as.integer(lmin)))) %>%
+    left_join(., geo_info, join_by("geo" == "id_region")) %>% st_as_sf() %>%
+    ggplot() +
+      geom_sf(aes(fill = tmp)) +
+      labs(title = "Average Temperatures", fill = "T [°C]",
+           x = "© EuroGeographics for the administrative boundaries", y = "© E-OBS for the temperature data") +
+      theme(legend.position = "right") +
+      scale_fill_gradientn(colors = c("#0066FF", "#00CCFF", "#66FF00", "#FFFF00", "#FF7F00", "#FF0000", "#CF00FF", "#9F00FF"),
+                           breaks = seq(15, 30, 5), limits = c(12.0, 33.0)) +
+      geom_sf(inherit.aes = FALSE, aes(), linewidth = 0.05, color = "black", fill = NA) +
+      std_theme() +
+      facet_wrap(~cat, nrow = 3, dir = "h"))
+```
+
+## Outcome Plots: Deaths (Absolute, Standardized)
+
+```{r deaths_plots}
+  # EU-27 + EFTA Standard Population 2013, with 0-4 years combined into one group and 85+ years combined into one group, plus 4 coarse age categories
+  population_eu_5y <- data.frame(age = paste(seq(0, 85, 5), c(seq(4, 84, 5), 99), sep = "-"),
+                                 n_pop_eu27 = 100 * c(50, 55, 55, 55, 60, 60, 65, 70, 70, 70, 70, 65, 60, 55, 50, 40, 25, 25))
+  population_eu_4cat <- left_join(population_eu_5y, age_aggregate, by = "age") %>% group_by(age = age_cat) %>% reframe(n_pop_eu27 = sum(n_pop_eu27))
+  population_eu <- distinct(rbind(population_eu_5y, population_eu_4cat))
+
+  # calculate total deaths for each country and for a standard population in each country
+  deaths_total <- left_join(deaths_4cat %>% mutate(year = year(date_from)), population_4cat, by = c("geo", "country", "year", "sex", "age")) %>%
+    group_by(country, year, age, date_from) %>% reframe(n_deaths = sum(n_deaths), n_pop = sum(n_pop)) %>%
+    left_join(., population_eu, by = "age") %>% mutate(n_deaths_std = n_deaths * n_pop_eu27 / n_pop) %>%
+    group_by(country, year, date_from) %>% reframe(n_deaths = sum(n_deaths), n_deaths_std = sum(n_deaths_std))
+
+  # deaths (observed)
+  pngplot("Figure_S5", aspect_ratio = 1.2,
+    deaths_total %>% filter(year <= 2019, country != "Luxemburg") %>%
+    mutate(panel = sprintf("%d-%d", year - (year %% 5), year + 4 - (year %% 5))) %>%
+    ggplot(aes(x = date_from, y = n_deaths, group_by = country, color = country)) +
+      geom_line(linewidth = 0.5) +
+      scale_x_continuous(breaks = MID_YEAR_DATES, labels = ~sprintf("July 1st, %s", year(.x))) +
+      labs(title = "Deaths (Observed)", color = "Country", x = "", y = "Weekly Deaths") +
+      scale_color_manual(values = safe_colorblind_palette) +
+      std_theme() + theme(legend.position = "top") + facet_wrap(~panel, ncol = 1, scales = "free_x"))
+
+  # deaths (standardized, with mean over all weekly deaths removed by country)
+  pngplot("Figure_S6", aspect_ratio = 1.2,
+    deaths_total %>% filter(year <= 2019, country != "Luxemburg") %>%
+    group_by(country) %>% mutate(n_deaths_std = n_deaths_std - mean(n_deaths_std)) %>% ungroup() %>%
+    mutate(panel = sprintf("%d-%d", year - (year %% 5), year + 4 - (year %% 5))) %>%
+    ggplot(aes(x = date_from, y = n_deaths_std, group_by = country, color = country)) +
+      geom_line(linewidth = 0.5) +
+      scale_x_continuous(breaks = MID_YEAR_DATES, labels = ~sprintf("July 1st, %s", year(.x))) +
+      labs(title = "Deaths (EU27 Standard Population)", color = "Country", x = "", y = "Weekly Deaths - Mean(Weekly Deaths)") +
+      scale_color_manual(values = safe_colorblind_palette) +
+      std_theme() + theme(legend.position = "top") + facet_wrap(~panel, ncol = 1, scales = "free_x"))
+```
+
+## Exposure Response (Raw)
+
+Exposure response is shown by country, as the sum over the regions, by temperature bracket (integer degree +/- 0.5 degrees)
+
+```{r exposure_response_plot}
+  # define temperature exposure for a week as the maximum over the 1-to-3 day lagged average temperatures, over the days of the week
+  tmpc_exposure <- temperatures_weekly_lagged %>%
+    mutate(tmpc_max_lag_0_3 = round(pmax(tmpc_lag_0_3_dow_0, tmpc_lag_0_3_dow_1, tmpc_lag_0_3_dow_2, tmpc_lag_0_3_dow_3,
+                                         tmpc_lag_0_3_dow_4, tmpc_lag_0_3_dow_5, tmpc_lag_0_3_dow_6), 0)) %>%
+    select(geo, date_from, tmpc_max_lag_0_3)
+
+  # retrieve deaths per country, append population and exposure data, bucket exposure by degree, sum exposed population, compute death rate
+  incremental_death_rate_by_country_exposure_by_region <-
+    left_join(deaths_4cat %>% mutate(year = year(date_from)), population_4cat, by = c("geo", "country", "year", "sex", "age")) %>%
+    filter(date_from >= min(week_table$date_from), year <= 2019) %>%
+    group_by(geo, year, sex, age) %>% mutate(n_deaths = n_deaths - mean(n_deaths)) %>% ungroup() %>%
+    left_join(., tmpc_exposure, by = c("geo", "date_from")) %>%
+    mutate(decade = sprintf("%d-%d", 10 * (year %/% 10), 10 * (year %/% 10) + 9)) %>%
+    group_by(country, decade, age, tmpc_max_lag_0_3) %>% reframe(r_deaths = 100000.0 * sum(n_deaths) / sum(n_pop), n_pop = sum(n_pop))
+
+  pngplot("Figure_1", aspect_ratio = 1.0,
+    incremental_death_rate_by_country_exposure_by_region %>% filter(age %in% c("65-74", "75-84", "85-99"), tmpc_max_lag_0_3 >= 5.0) %>%
+    ggplot(aes(x = tmpc_max_lag_0_3, y = r_deaths, group_by = country, color = country, weight = n_pop)) +
+      geom_smooth(formula = y ~ x, method = "loess", span = 0.7, se = FALSE) +
+      geom_point(aes(size = n_pop)) + scale_size(name = "Exposed Population", labels = NULL, range = c(1, 3)) +
+      labs(title = "Raw Exposure Response Curves, Incremental Deaths, 65+ Years", color = "",
+           x = "Exposure: Mean Temperature over prior 0:3 Days, Maximum over 7 Days of Week",
+           y = "Weekly Rate of Incremental Deaths [1/100k] (vs. Region-Year-Sex-Age Mean, All Regions)") +
+      ylim(NA, 300) + scale_x_continuous(breaks = seq(10, 30, 10), labels = ~sprintf("%d °C", .x)) +
+      scale_color_manual(values = safe_colorblind_palette) + std_theme() + theme(legend.position = "top") + facet_grid(vars(decade), vars(age)))
+
+  pngplot("Figure_2", aspect_ratio = 1.0,
+    incremental_death_rate_by_country_exposure_by_region %>% filter(age == "85-99", tmpc_max_lag_0_3 >= 5.0) %>%
+    ggplot(aes(x = tmpc_max_lag_0_3, y = r_deaths, group_by = decade, color = decade, weight = n_pop)) +
+      geom_smooth(formula = y ~ x, method = "loess", span = 0.7, se = FALSE) +
+      geom_point(aes(size = n_pop)) + scale_size(name = "Exposed Population", labels = NULL, range = c(1, 3)) +
+      labs(title = "Raw Exposure Response Curves, Incremental Deaths, 85+ Years", color = "",
+           x = "Exposure: Mean Temperature over prior 0:3 Days, Maximum over 7 Days of Week",
+           y = "Weekly Rate of Incremental Deaths [1/100k] (vs. Region-Year-Sex-Age Mean, All Regions)") +
+      ylim(NA, 300) + scale_x_continuous(breaks = seq(10, 30, 10), labels = ~sprintf("%d °C", .x)) +
+      std_theme() + theme(legend.position = "top") + facet_wrap(~country, nrow = 3))
+```
+
+## Combine Required Data
+
+Combine deaths and populations, append (lagged) temperature exposures, filter on summer weeks
+
+```{r combine_geography_deaths_temperatures}
+  # combine deaths and populations, adding week of year(Mon after Sat week start for UK, Wed for rest of Europe), select summer weeks only
+  df_summer <- left_join(deaths_4cat %>% mutate(year = year(date_from)), population_4cat, by = c("geo", "country", "year", "sex", "age")) %>%
+    filter(date_from >= min(week_table$date_from)) %>%
+    mutate(week = gsub("^.*W", "", ISOweek(date_from + 2))) %>%
+    left_join(., temperatures_weekly_lagged, by = c("geo", "date_from")) %>%
+    mutate(across(c(geo, country, sex), ~fct_inorder(.x))) %>%
+    mutate(across(c(date_from, year, week, n_deaths, n_pop), ~as.integer(.x))) %>%
+    filter(week >= FIRST_SUMMER_WEEK, week <= LAST_SUMMER_WEEK) %>%
+    filter(date_from >= min(week_table$date_from), date_from <= max(week_table$date_from))
+  save(df_summer, file = "../Processed/DeathsPopTemp.Rdata", compress = "xz")
+```
+
+## Pass 1 - Fit Simple GAMs, by Age, by Region, by Year: Onset of Heat-Related Risk
+
+Initially, a set of simple Poisson GAMs is computed across summer weeks, separately by age, region, and year:
+
+1. Proportionality to the exposed population is ensured via a parametric "offset(log(n_pop))" term.
+2. Heat wave effects are modeled as a smooth term of the continuous variable mean temperature, for the prior 0:3 days (as in model-free response curve).
+3. A parametric term scales the heat response between sexes.
+
+Note that the summation convention of mgcv::bam is exploited to sum over the seven days of each week, after evaluation of the smooth function...
+
+```{r fit_simple_GAMS_by_age_by_region_by_year_pass1}
+  load("../Processed/DeathsPopTemp.Rdata")
+
+  # fit GAMs to determine onset of heat-related risk (mean temperature 0:3 days)
+  do_models <-expand.grid(a = unique(df_summer$age), g = unique(df_summer$geo), y = unique(df_summer$year))
+  df_tzero <- foreach (i = 1: nrow(do_models), .combine = "rbind") %dopar% {
+    a = do_models$a[i]
+    g = do_models$g[i]
+    y = do_models$y[i]
+    
+    # extract subset of data for sex, age, region, and year (actual, observed temperatures)
+    df_actual <- df_summer %>% filter(age == a, geo == g, year == y)
+
+    # treat years with data
+    if (nrow(df_actual) != 0) {
+      # fit GAM using the summation convention (after evaluation of smooth function for each variable)
+      gam1 <- bam(n_deaths ~ offset(log(n_pop)) + sex +
+                    s(as.matrix(tmpc_lag_0_3_dow_0, tmpc_lag_0_3_dow_1, tmpc_lag_0_3_dow_2, tmpc_lag_0_3_dow_3,tmpc_lag_0_3_dow_4, tmpc_lag_0_3_dow_5, tmpc_lag_0_3_dow_6), k = DOF_TMPC, bs = "ps"),
+                  data = df_actual, family = poisson(), discrete = TRUE)
+
+      # extract the one and only smooth response term (0:3 days)
+      pdf(NULL); gam_plot <- plot(gam1, n = 201, rug = FALSE); ignore <- dev.off()
+      gam_obj <- gam_plot[[1]]
+      response_0_3 <- data.frame(t = gam_obj$x, y = gam_obj$fit, se = gam_obj$se, var = gam_obj$xlab)
+
+      # determine highest protective temperature, i.e., response < 0 => exp(response) < 1
+      t_zero <- response_0_3 %>% filter(y < 0.0) %>% arrange(desc(t)) %>% head(1) %>% pull("t")
+      data.frame(t_zero = t_zero, age = a, geo = g, year = y)
+    } else {
+      NULL
+    }
+  }
+
+  # number of models fitted
+  print(nrow(df_tzero))
+
+  # compute median temperature for onset of heat-related risk by age and region
+  df_tzero_age_geo <- df_tzero %>% group_by(age, geo) %>% reframe(t_zero = round(median(t_zero), 1))
+
+  # document median by region
+  df_tzero_age_geo %>% mutate(geo = as.character(geo), age = factor(age, levels = c("0-64", "65-74", "75-84", "85-99"))) %>%
+    arrange(geo, age) %>% pivot_wider(values_from = "t_zero", names_from = "age") %>%
+    flextable() %>% set_caption("Onset of Heat-Related Risk (0:3 Days)") %>% autofit() %>%
+    save_as_docx(path = "../Tables/Onset_Heat_Risk.docx")
+
+  # reload geography data and plot onset temperatures
+  load(file = "../Processed/Geography.Rdata")
+  pngplot("Figure_3", aspect_ratio = 1.0,
+    df_tzero_age_geo %>%
+    left_join(., geo_info, join_by("geo" == "id_region")) %>% st_as_sf() %>%
+    ggplot() +
+      geom_sf(aes(fill = t_zero)) +
+      labs(title = "Onset of Heat-Related Risk", fill = "T [°C]",
+           x = "© EuroGeographics for the administrative boundaries", y = "© E-OBS for the temperature data") +
+      theme(legend.position = "right") +
+      scale_fill_gradientn(colors = c("#0066FF", "#00CCFF", "#66FF00", "#FFFF00", "#FF7F00", "#FF0000", "#CF00FF", "#9F00FF"),
+                           breaks = seq(15, 30, 5), limits = c(12.0, 33.0)) +
+      geom_sf(inherit.aes = FALSE, aes(), linewidth = 0.05, color = "black", fill = NA) +
+      std_theme() + facet_wrap(~age))
+  
+  # shift onset of heat-related risk to 0 °C by region
+  df_summer_shifted <- df_summer %>% left_join(., df_tzero_age_geo, by = c("geo", "age")) %>% mutate(across(starts_with("tmpc"), ~.x - t_zero))
+```
+
+## Pass 2 - Fit extended GAMs, by Sex and Age: Common Exposure Response
+
+A set of Poisson GAMs is computed across summer weeks, across regions and years, separately for each combination of sex and age (group):
+
+1. Proportionality to the exposed population is ensured via a parametric "offset(log(n_pop))" term.
+2. Heat wave effects are modeled as smooth terms of the continuous variable mean temperature, for the current day and the prior 0:3, 4:7 and 8:11 days.
+3. Parametric terms scale the heat response by region and (continuous) year.
+
+Note that the summation convention of mgcv::bam is exploited to sum over the seven days of each week, after evaluation of the smooth function...
+
+Note that the exposure has been shifted to move the onset of heat-related risks to 0, and that the minima for 0:3 days are at slightly lower temperatures (about -1.0 °C).
+
+```{r fit_GAMs_by_sex_by_age_pass2}
+  # limit parallel processing to actual number of cores
+  RhpcBLASctl::blas_set_num_threads(RhpcBLASctl::get_num_cores())
+
+  # fit a single GAM across all countries and all years, for each combination of sex and age (group)
+  df_resp <- data.frame()
+  df_mort <- data.frame()
+  df_coef <- data.frame()
+  for (s in unique(df_summer_shifted$sex)) {
+    for (a in unique(df_summer_shifted$age)) {
+      # extract subset of data for sex and age
+      df_actual <- df_summer_shifted %>% filter(sex == s, age == a)
+
+      # fit a GAM, using the summation convention (after evaluation of smooth function for each variable)
+      gam2 <- bam(n_deaths ~ offset(log(n_pop)) + 0 + geo:factor(year) +
+                    s(as.matrix(tmpc_lag_0_0_dow_0,  tmpc_lag_0_0_dow_1,  tmpc_lag_0_0_dow_2,  tmpc_lag_0_0_dow_3,  tmpc_lag_0_0_dow_4,  tmpc_lag_0_0_dow_5,  tmpc_lag_0_0_dow_6),  k = DOF_TMPC, bs = "ps") +
+                    s(as.matrix(tmpc_lag_0_3_dow_0,  tmpc_lag_0_3_dow_1,  tmpc_lag_0_3_dow_2,  tmpc_lag_0_3_dow_3,  tmpc_lag_0_3_dow_4,  tmpc_lag_0_3_dow_5,  tmpc_lag_0_3_dow_6),  k = DOF_TMPC, bs = "ps") +
+                    s(as.matrix(tmpc_lag_4_7_dow_0,  tmpc_lag_4_7_dow_1,  tmpc_lag_4_7_dow_2,  tmpc_lag_4_7_dow_3,  tmpc_lag_4_7_dow_4,  tmpc_lag_4_7_dow_5,  tmpc_lag_4_7_dow_6),  k = DOF_TMPC, bs = "ps") +
+                    s(as.matrix(tmpc_lag_8_11_dow_0, tmpc_lag_8_11_dow_1, tmpc_lag_8_11_dow_2, tmpc_lag_8_11_dow_3, tmpc_lag_8_11_dow_4, tmpc_lag_8_11_dow_5, tmpc_lag_8_11_dow_6), k = DOF_TMPC, bs = "ps"),
+                  data = df_actual, family = poisson(), discrete = TRUE, nthreads = RhpcBLASctl::get_num_cores(), control = gam.control(nthreads = RhpcBLASctl::get_num_cores()))
+
+      # predict response for actual, observed temperatures and for counterfactually capped temperature, accumulate heat-related mortality
+      for (t_cap in seq(-2.0, 0.0, 0.2)) {
+        df_capped <- df_actual %>% mutate(across(starts_with("tmpc_lag_"), ~pmin(.x, t_cap)))
+        p_act <- predict(gam2, type = "response", newdata = df_actual, se.fit = TRUE)
+        p_cap <- predict(gam2, type = "response", newdata = df_capped, se.fit = TRUE)
+        df_mort <- rbind(df_mort, data.frame(df_actual %>% select(country, geo, year, sex, age), hr = p_act$fit - p_cap$fit, se = sqrt(p_act$se * p_act$se + p_cap$se * p_cap$se), t_cap = t_cap))
+      }
+      
+      # accumulate coefficients by region and by year
+      df_coef <- rbind(df_coef, data.frame(summary(gam2)$p.table) %>% mutate(var = rownames(.), sex = s, age = a))
+
+      # extract smooth responses
+      pdf(NULL)
+      gam_plot <- plot(gam2, n = 201, rug = FALSE)
+      ignore <- dev.off()
+      for (gam_obj in gam_plot) {
+        if (gam_obj$plot.me) {
+          if (grepl("^s[(]", gam_obj$ylab)) {
+            df_resp <- rbind(df_resp, data.frame(x = gam_obj$x, y = gam_obj$fit, se = gam_obj$se, var = gam_obj$xlab, Sex = s, Age = a))
+          }
+        }
+      }
+    }
+  }
+  
+  # save results
+  save(df_tzero, df_resp, df_mort, df_coef, file = "../Processed/Results.Rdata", compress = "xz")
+
+  # tweak variable names and factor age
+  df_resp <- df_resp %>%
+    mutate(var = str_replace_all(var, c("^.*, tmpc_lag_" = "", "_dow_6.*$" = "", "_" = "-", "$" = " Days"))) %>%
+    mutate(Age = factor(Age, levels = c("85-99", "75-84", "65-74", "0-64")))
+
+  # heat-related terms (by sex by age), above 15 °C
+  pngplot("Figure_4", aspect_ratio = 1.2,
+    df_resp %>% filter(x >= -15.0) %>%
+    mutate(ymin = y + qnorm(0.025) * se, ymax = y + qnorm(0.975) * se) %>%
+    ggplot(aes(x = x, y = y, ymin = ymin, ymax = ymax, group_by = Age, color = Age)) +
+      geom_ribbon(aes(fill = Age), alpha = 0.1, color = NA) +
+      geom_line(linewidth = 1.0) +
+      labs(x = "Temperature Exposure [°C]", y = "Mortality Response with 95% Confidence Intervals", title = "Common Exposure Response: Heat-Related Risk") +
+      scale_color_manual(values = safe_colorblind_palette[4:7]) + scale_fill_manual(values = safe_colorblind_palette[4:7]) +
+      std_theme() + facet_grid(vars(var), vars(Sex)))
+
+  # create summary table of estimated heat-related deaths by country by year
+  hr_estimate <- df_mort %>% filter(t_cap == -1.0) %>%
+    group_by(country, year) %>% reframe(hr = round(sum(hr), 0), se = sqrt(sum(se * se))) %>%
+    mutate(ymin = round(hr + qnorm(0.025) * se, 0), ymax = round(hr +  qnorm(0.975) * se, 0)) %>%
+    select(country, year, hr, ymin, ymax) %>% arrange(country, year) %>%
+    mutate(hr = sprintf("%.0f\n[%.0f; %.0f]", hr, ymin, ymax)) %>% select(country, year, hr) %>%
+    pivot_wider(names_from = "country", values_from = "hr") %>% mutate(year = as.character(year))
+  hr_estimate %>% select(year, England, France, Germany, Italy, Spain) %>%
+    flextable() %>% set_caption("Heat-Related Mortality Estimates") %>% autofit() %>%
+    save_as_docx(path = "../Tables/Heat_Related_Mortality_Top5.docx")
+  hr_estimate %>% select(year, Austria, Belgium, Netherlands, Luxemburg, Portugal, Switzerland, Wales) %>%
+    flextable() %>% set_caption("Heat-Related Mortality Estimates") %>% autofit() %>%
+    save_as_docx(path = "../Tables/Heat_Related_Mortality_Other.docx")
+
+  # plot coefficients (load factors) over time
+  pngplot("Figure_5", aspect_ratio = 0.8,
+    df_coef %>% filter(complete.cases(.), age == "85-99") %>%
+      group_by(var) %>% reframe(Estimate = mean(Estimate)) %>%
+      separate_wider_delim(var, delim = ":", names = c("geo", "year")) %>%
+      mutate(geo = gsub("^geo", "", geo), year = as.integer(gsub("factor.year.", "", year)), Estimate = exp(Estimate - mean(Estimate))) %>%
+      left_join(., geo_info, join_by("geo" == "id_region")) %>% st_as_sf() %>%
+    ggplot() +
+      geom_sf(aes(fill = Estimate), color = NA) +
+      labs(title = "Response Scale Factors over Time (85+ Years)", fill = "Factor", x = "", y = "") +
+      scale_fill_viridis_c(option = "C", breaks = seq(0.6, 1.8, 0.2)) +
+      scale_x_continuous(breaks = seq(-5.0, 15.0, 10.0)) +
+      scale_y_continuous(breaks = seq(35.0, 55.0,  5.0)) +
+      std_theme() + theme(legend.position = "right", panel.spacing = unit(1, "mm")) + facet_wrap(~year, nrow = 4))  # plot coefficients (load factors) over time
+  pngplot("Figure_S7", aspect_ratio = 0.8,
+    df_coef %>% filter(complete.cases(.), age == "75-84") %>%
+      group_by(var) %>% reframe(Estimate = mean(Estimate)) %>%
+      separate_wider_delim(var, delim = ":", names = c("geo", "year")) %>%
+      mutate(geo = gsub("^geo", "", geo), year = as.integer(gsub("factor.year.", "", year)), Estimate = exp(Estimate - mean(Estimate))) %>%
+      left_join(., geo_info, join_by("geo" == "id_region")) %>% st_as_sf() %>%
+    ggplot() +
+      geom_sf(aes(fill = Estimate), color = NA) +
+      labs(title = "Response Scale Factors over Time (75-84 Years)", fill = "Factor", x = "", y = "") +
+      scale_fill_viridis_c(option = "C", breaks = seq(0.6, 1.8, 0.2)) +
+      scale_x_continuous(breaks = seq(-5.0, 15.0, 10.0)) +
+      scale_y_continuous(breaks = seq(35.0, 55.0,  5.0)) +
+      std_theme() + theme(legend.position = "right", panel.spacing = unit(1, "mm")) + facet_wrap(~year, nrow = 4))
+  pngplot("Figure_S8", aspect_ratio = 0.8,
+    df_coef %>% filter(complete.cases(.), age == "65-74") %>%
+      group_by(var) %>% reframe(Estimate = mean(Estimate)) %>%
+      separate_wider_delim(var, delim = ":", names = c("geo", "year")) %>%
+      mutate(geo = gsub("^geo", "", geo), year = as.integer(gsub("factor.year.", "", year)), Estimate = exp(Estimate - mean(Estimate))) %>%
+      left_join(., geo_info, join_by("geo" == "id_region")) %>% st_as_sf() %>%
+    ggplot() +
+      geom_sf(aes(fill = Estimate), color = NA) +
+      labs(title = "Response Scale Factors over Time (65-74 Years)", fill = "Factor", x = "", y = "") +
+      scale_fill_viridis_c(option = "C", breaks = seq(0.6, 1.8, 0.2)) +
+      scale_x_continuous(breaks = seq(-5.0, 15.0, 10.0)) +
+      scale_y_continuous(breaks = seq(35.0, 55.0,  5.0)) +
+      std_theme() + theme(legend.position = "right", panel.spacing = unit(1, "mm")) + facet_wrap(~year, nrow = 4))
+```
