@@ -552,7 +552,7 @@ Citation: Cornes, R., G. van der Schrier, E.J.M. van den Besselaar, and P.D. Jon
 
   # deaths (observed)
   pngplot("Figure_S5", aspect_ratio = 1.2,
-    deaths_total %>% filter(year <= 2019, country != "Luxemburg") %>%
+    deaths_total %>% filter(year <= 2019, country != "Luxembourg") %>%
     mutate(panel = sprintf("%d-%d", year - (year %% 5), year + 4 - (year %% 5))) %>%
     ggplot(aes(x = date_from, y = n_deaths, group_by = country, color = country)) +
       geom_line(linewidth = 0.5) +
@@ -563,7 +563,7 @@ Citation: Cornes, R., G. van der Schrier, E.J.M. van den Besselaar, and P.D. Jon
 
   # deaths (standardized, with mean over all weekly deaths removed by country)
   pngplot("Figure_S6", aspect_ratio = 1.2,
-    deaths_total %>% filter(year <= 2019, country != "Luxemburg") %>%
+    deaths_total %>% filter(year <= 2019, country != "Luxembourg") %>%
     group_by(country) %>% mutate(n_deaths_std = n_deaths_std - mean(n_deaths_std)) %>% ungroup() %>%
     mutate(panel = sprintf("%d-%d", year - (year %% 5), year + 4 - (year %% 5))) %>%
     ggplot(aes(x = date_from, y = n_deaths_std, group_by = country, color = country)) +
@@ -795,7 +795,7 @@ Note that the exposure has been shifted to move the onset of heat-related risks 
   hr_estimate %>% select(year, England, France, Germany, Italy, Spain) %>%
     flextable() %>% set_caption("Heat-Related Mortality Estimates") %>% autofit() %>%
     save_as_docx(path = "../Tables/Heat_Related_Mortality_Top5.docx")
-  hr_estimate %>% select(year, Austria, Belgium, Netherlands, Luxemburg, Portugal, Switzerland, Wales) %>%
+  hr_estimate %>% select(year, Austria, Belgium, Netherlands, Luxembourg, Portugal, Switzerland, Wales) %>%
     flextable() %>% set_caption("Heat-Related Mortality Estimates") %>% autofit() %>%
     save_as_docx(path = "../Tables/Heat_Related_Mortality_Other.docx")
 
